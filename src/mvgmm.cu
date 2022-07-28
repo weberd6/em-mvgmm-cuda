@@ -116,9 +116,9 @@ void rmvgmm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
 
     float alpha = 1.0;
     float beta = 1.0;
-    CUBLAS_CHECK(cublasSgemvBatched(cublasHandle, CUBLAS_OP_N, D, D,
-                                    &alpha, d_ptrCovariances, D, d_ptrSamples, 1,
-                                    &beta, d_ptrMeans, 1, N));
+    CUBLAS_CHECK(cublasSgemmBatched(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, N, D,
+                                    &alpha, d_ptrCovariances, D, d_ptrSamples, D,
+                                    &beta, d_ptrMeans, D, N));
 
     for (int n = 0; n < N; n++) {
         CUDA_CHECK(cudaMemcpy(&d_randomValues[n * D], d_ptrMeans[n], D * sizeof(float),
