@@ -158,28 +158,32 @@ void rmvnorm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
     // Do cholesky decomposition on covariance matrices L*transpose(L)
 
     int Lwork;
-    thrust::device_vector<float> d_covarianceLU(d_covariance, d_covariance + D * D);
+ 
+    thrust::device_vector<float> d_covarianceLower(D * D);
+    cudaMemcpy(thrust::raw_pointer_cast(d_covarianceLower.data()),
+               d_covariance, D * D * sizeof(float), cudaMemcpyDeviceToDevice);
+ 
     cusolverDnSpotrf_bufferSize(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D,
-                                thrust::raw_pointer_cast(d_covarianceLU.data()), D, &Lwork);
+                                thrust::raw_pointer_cast(d_covarianceLower.data()), D, &Lwork);
 
-    int devInfo;
+    thrust::device_vector<int> d_devInfo(1);
     thrust::device_vector<float> d_workspace(Lwork);
     cusolverDnSpotrf(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D,
-                     thrust::raw_pointer_cast(d_covarianceLU.data()), D,
-                     thrust::raw_pointer_cast(d_workspace.data()), Lwork, &devInfo);
+                     thrust::raw_pointer_cast(d_covarianceLower.data()), D,
+                     thrust::raw_pointer_cast(d_workspace.data()), Lwork,
+                     thrust::raw_pointer_cast(d_devInfo.data()));
 
     // Generate standard normal variables, (D * N) samples
 
     thrust::device_vector<float> d_randomNorm(D * N);
     curandGenerateNormal(gen, thrust::raw_pointer_cast(d_randomNorm.data()), D * N, 0.0, 1.0);
 
-    // x[i] = m + L*u[i] where u are standard normal distributed values
-    // L and m are chosen from the K sets of parameters
+    // Generate multivariate normal from standard normal with mean and covariance lower
 
     float alpha = 1.0;
     float beta = 0.0;
     cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, N, D, &alpha,
-                thrust::raw_pointer_cast(d_covarianceLU.data()), D,
+                thrust::raw_pointer_cast(d_covarianceLower.data()), D,
                 thrust::raw_pointer_cast(d_randomNorm.data()), D,
                 &beta, d_randomMvNorm, D);
 
@@ -194,7 +198,6 @@ void meanAndCovariance(cublasHandle_t cublasHandle, int D, int N, const float *d
     thrust::device_vector<float> d_cov1(D * D);
     thrust::device_vector<float> d_cov2(D * D);
     thrust::device_vector<float> d_ones(N, 1.0);
-    thrust::device_vector<float> d_means(D);
 
     // X*transpose(X) / N
     alpha = 1.0f / N;
@@ -206,13 +209,12 @@ void meanAndCovariance(cublasHandle_t cublasHandle, int D, int N, const float *d
     alpha = 1.0f / N;
     CUBLAS_CHECK(cublasSgemv(cublasHandle, CUBLAS_OP_N, D, N,
                              &alpha, d_data, D, thrust::raw_pointer_cast(d_ones.data()), 1,
-                             &beta, thrust::raw_pointer_cast(d_means.data()), 1));
+                             &beta, d_mean, 1));
 
     // means * transpose(means)
     alpha = 1.0f;
     CUBLAS_CHECK(cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, D, D, 1,
-                             &alpha, thrust::raw_pointer_cast(d_means.data()), 1,
-                             thrust::raw_pointer_cast(d_means.data()), 1,
+                             &alpha, d_mean, 1, d_mean, 1,
                              &beta, thrust::raw_pointer_cast(d_cov2.data()), D));
 
     //  (X*transpose(X) / N) -  means * transpose(means)
@@ -235,8 +237,8 @@ __global__ void calculateWeightedLogPdf(int N, int K, const float *d_weights, fl
     }
 }
 
-void expectationMaximizationMultivariateGaussianMixtureModel(cublasHandle_t cublasHandle,
-        cusolverDnHandle_t cusolverHandle, int D, int N, int K, const float *d_data) {
+void expectationMaximizationMVGMM(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
+                                  int D, int N, int K, const float *d_data) {
 
     thrust::device_vector<float> d_means(K * D);
     thrust::device_vector<float> d_covariances(K * D * D);
@@ -252,12 +254,13 @@ void expectationMaximizationMultivariateGaussianMixtureModel(cublasHandle_t cubl
 
     thrust::device_vector<float> d_mean(D);
     thrust::device_vector<float> d_covariance(D*D);
-    meanAndCovariance(cublasHandle, D, N, d_data, thrust::raw_pointer_cast(d_mean.data()),
+    meanAndCovariance(cublasHandle, D, N, d_data,
+                      thrust::raw_pointer_cast(d_mean.data()),
                       thrust::raw_pointer_cast(d_covariance.data()));
 
     // Generate random cluster means
 
-    rmvnorm(cublasHandle, cusolverHandle, N, D, thrust::raw_pointer_cast(d_mean.data()),
+    rmvnorm(cublasHandle, cusolverHandle, K, D, thrust::raw_pointer_cast(d_mean.data()),
             thrust::raw_pointer_cast(d_covariance.data()), thrust::raw_pointer_cast(d_means.data()));
 
     // Initialize all covariances to be the same. covariance of the data divided by number of clusters
@@ -267,6 +270,13 @@ void expectationMaximizationMultivariateGaussianMixtureModel(cublasHandle_t cubl
     thrust::transform(d_covariance.begin(), d_covariance.end(), nclusters,
                       d_covariance.begin(), thrust::divides<float>());
 
+    for (int k = 0; k < K; k++) {
+        cudaMemcpy(thrust::raw_pointer_cast(&d_covariances[k * D * D]),
+                   thrust::raw_pointer_cast(d_covariance.data()),
+                   D * D * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+/*
     bool converged = false;
     float epsilon = 1.0e-5;
     float Q = -INFINITY;
@@ -274,11 +284,11 @@ void expectationMaximizationMultivariateGaussianMixtureModel(cublasHandle_t cubl
     thrust::device_vector<float> d_responsibilities(K * N);
 
     while (!converged) {
-
+*/
         eStep(cublasHandle, D, N, K, d_data, thrust::raw_pointer_cast(h_weights.data()),
               thrust::raw_pointer_cast(d_means.data()), thrust::raw_pointer_cast(d_covariance.data()),
               thrust::raw_pointer_cast(d_responsibilities.data()));
-
+/*
         mStep(cublasHandle, D, N, K, d_data, thrust::raw_pointer_cast(d_responsibilities.data()),
               thrust::raw_pointer_cast(h_weights.data()), thrust::raw_pointer_cast(d_means.data()),
               thrust::raw_pointer_cast(d_covariance.data()));
@@ -301,4 +311,5 @@ void expectationMaximizationMultivariateGaussianMixtureModel(cublasHandle_t cubl
 
         Q = Qn;
     }
+*/
 }

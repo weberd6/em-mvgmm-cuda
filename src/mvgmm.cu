@@ -55,6 +55,24 @@ __global__ void assignCluster(int K, int N, const float *d_weights, const float 
     }
 }
 
+__global__ void setupBatchMultiply(int N, int D, const int *d_clusters, float *d_normalRand,
+                                    float **d_meansArray, float **d_covariancesArray,
+                                    float **d_ptrSamples, float **d_ptrMeans, float **d_ptrCovariances,
+                                    float *d_resultMatrix)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n < N) {
+
+        d_ptrSamples[n] = &d_normalRand[n * D];
+
+        memcpy(&d_resultMatrix[n * D], d_meansArray[d_clusters[n]], D * sizeof(float));
+        d_ptrMeans[n] = &d_resultMatrix[n * D];
+
+        d_ptrCovariances[n] = d_covariancesArray[d_clusters[n]];
+    }
+}
+
 void rmvgmm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
                     int N, int D, int K, const float *d_weights, const float *d_means,
                     const float *d_covariances, float *d_randomValues) {
@@ -70,7 +88,7 @@ void rmvgmm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
     // Assign N clusters based on random uniform values and weights
 
     int threadsPerBlock = 256;
-    int blocks = std::ceil(N / 256);
+    int blocks = std::ceil(N / threadsPerBlock);
     thrust::device_vector<int> d_clusters(N);
     assignCluster<<<blocks, threadsPerBlock>>>(K, N, d_weights,
                                                thrust::raw_pointer_cast(d_uniformRand.data()),
@@ -78,52 +96,55 @@ void rmvgmm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
 
     // Copy means and covariances to arrays of pointers
 
-    float *d_meansArray[K];
-    float *d_covariancesArray[K];
+    std::vector<float*> meansArray(K);
+    std::vector<float*> covariancesArray(K);
     for (int k = 0; k < K; k++) {
 
-        CUDA_CHECK(cudaMalloc((float**)&d_meansArray[k], D * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_meansArray[k], &d_means[k * D], D * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMalloc(&meansArray[k], D * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(meansArray[k], &d_means[k * D], D * sizeof(float), cudaMemcpyDeviceToDevice));
 
-        CUDA_CHECK(cudaMalloc((float**)&d_covariancesArray[k], D * D * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_covariancesArray[k], &d_covariances[k * D * D],
+        CUDA_CHECK(cudaMalloc(&covariancesArray[k], D * D * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(covariancesArray[k], &d_covariances[k * D * D],
                               D * D * sizeof(float), cudaMemcpyDeviceToDevice));
     }
+    thrust::device_vector<float*> d_meansArray = meansArray;
+    thrust::device_vector<float*> d_covariancesArray = covariancesArray;
 
     // Do cholesky decomposition on covariance matrices L*transpose(L)
 
-    thrust::device_vector<int> infoArray(K);
-    CUSOLVER_CHECK(cusolverDnSpotrfBatched(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D, d_covariancesArray, D,
-                            thrust::raw_pointer_cast(infoArray.data()), K));
+    thrust::device_vector<int> d_infoArray(K);
+    CUSOLVER_CHECK(cusolverDnSpotrfBatched(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D,
+                                           thrust::raw_pointer_cast(d_covariancesArray.data()), D,
+                                           thrust::raw_pointer_cast(d_infoArray.data()), K));
 
     // Generate standard normal variables, (D * N) samples
 
-    curandGenerateNormal(gen, d_randomValues, D*N, 0.0, 1.0);
+    thrust::device_vector<float> d_normalRand(D * N);
+    curandGenerateNormal(gen, thrust::raw_pointer_cast(d_normalRand.data()), D * N, 0.0, 1.0);
 
     // For each sample, create pointer to assigned cluster mean and covariance lower
 
-    thrust::host_vector<int> h_clusters = d_clusters;
-    float *d_ptrSamples[N];
-    float *d_ptrCovariances[N];
-    float *d_ptrMeans[N];
-    for (int n = 0; n < N; n++) {
-        d_ptrSamples[n] = &d_randomValues[n * D];
-        d_ptrCovariances[n] = d_covariancesArray[h_clusters[n]];
-        d_ptrMeans[n] = d_meansArray[h_clusters[n]];
-    }
+    thrust::device_vector<float*> d_ptrSamples(N);
+    thrust::device_vector<float*> d_ptrCovariances(N);
+    thrust::device_vector<float*> d_ptrMeans(N);
+    setupBatchMultiply<<<blocks, threadsPerBlock>>>(N, D,
+                                            thrust::raw_pointer_cast(d_clusters.data()),
+                                            thrust::raw_pointer_cast(d_normalRand.data()),
+                                            thrust::raw_pointer_cast(d_meansArray.data()),
+                                            thrust::raw_pointer_cast(d_covariancesArray.data()),
+                                            thrust::raw_pointer_cast(d_ptrSamples.data()),
+                                            thrust::raw_pointer_cast(d_ptrMeans.data()),
+                                            thrust::raw_pointer_cast(d_ptrCovariances.data()),
+                                            d_randomValues);
 
     // Generate random multivarate normal by multiplying each data sample by covariance lower and adding mean
 
     float alpha = 1.0;
     float beta = 1.0;
-    CUBLAS_CHECK(cublasSgemmBatched(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, N, D,
-                                    &alpha, d_ptrCovariances, D, d_ptrSamples, D,
-                                    &beta, d_ptrMeans, D, N));
-
-    for (int n = 0; n < N; n++) {
-        CUDA_CHECK(cudaMemcpy(&d_randomValues[n * D], d_ptrMeans[n], D * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
-    }
+    CUBLAS_CHECK(cublasSgemmBatched(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, 1, D, &alpha,
+                                    thrust::raw_pointer_cast(d_ptrCovariances.data()), D,
+                                    thrust::raw_pointer_cast(d_ptrSamples.data()), D,
+                                    &beta, thrust::raw_pointer_cast(d_ptrMeans.data()), D, N));
 
     for (int k = 0; k < K; k++) {
         CUDA_CHECK(cudaFree(d_meansArray[k]));

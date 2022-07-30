@@ -1,4 +1,4 @@
-CUDA_ROOT_DIR = /opt/cuda
+CUDA_ROOT_DIR = /usr/local/cuda
 CUDA_LIB_DIR = $(CUDA_ROOT_DIR)/lib64
 CUDA_INC_DIR = $(CUDA_ROOT_DIR)/include
 
