@@ -1,11 +1,13 @@
 #include <em-mvgmm.h>
+#include <mvgmm.h>
+#include <mvnorm.h>
+#include <stats.h>
 #include <cublas_v2.h>
 #include <curand.h>
 #include <thrust/fill.h>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 #include <thrust/device_ptr.h>
-#include <mvgmm.h>
 
 // cublas API error checking
 #define CUBLAS_CHECK(err)                                                                          \
@@ -18,7 +20,7 @@
     } while (0)
 
 // d_matrix is NxK column-major order
-__global__ void normalizeExponentialColumWise(int N, int K, float *d_matrix)
+__global__ void eStep_normalizeExponentialColumWise(int N, int K, float *d_matrix)
 {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     float max_value = -INFINITY;
@@ -58,25 +60,27 @@ __global__ void normalizeExponentialColumWise(int N, int K, float *d_matrix)
 
 // d_data is DxN column-major order
 // d_responsibilities is NxK column-major order
-void eStep(cublasHandle_t cublasHandle, int D, int N, int K, const float *d_data, const float *h_weights,
-           const float *d_means, const float *d_covariances, float *d_responsibilities)
+void eStep(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle, int D, int N, int K,
+           const float *d_data, const float *h_weights, const float *d_means,
+           const float *d_covariances, float *d_responsibilities)
 {
     // Calculate log PDF for each data point to get log of new responsibility weights
 
-    dmvgmm(cublasHandle, N, D, K, d_data, h_weights, d_means, d_covariances, d_responsibilities, true);
+    dmvgmm(cublasHandle, cusolverHandle, N, D, K, d_data, h_weights, d_means, d_covariances, d_responsibilities, true);
 
     // Get real responsibilites by exponentiating and renormalizing
 
     int threadsPerBlock = 256;
-    int blocks = std::ceil(N / threadsPerBlock);
+    int blocks = std::ceil((float)N / threadsPerBlock);
     int sharedMem = K * threadsPerBlock * sizeof(float);
-    normalizeExponentialColumWise<<<blocks, threadsPerBlock, sharedMem>>>(N, K, d_responsibilities);
+
+    eStep_normalizeExponentialColumWise<<<blocks, threadsPerBlock, sharedMem>>>(N, K, d_responsibilities);
 }
 
 // d_data is DxN column-major order
 // d_weights is Nx1 vector
 // d_weighted_data is a DxN column-major
-__global__ void calculateWeightedData(int D, int N, const float *d_data, const float *d_weights,
+__global__ void mstep_calculateWeightedData(int D, int N, const float *d_data, const float *d_weights,
                                       float *d_weighted_data)
 {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -105,7 +109,7 @@ void mStep(cublasHandle_t cublasHandle, int D, int N, int K, const float *d_data
         // Recalculate weights
 
         thrust::device_ptr<float> r(&d_responsibilities[k * N]);
-        h_responsibilitiesSum[k] = thrust::reduce(r, r+N);
+        h_responsibilitiesSum[k] = thrust::reduce(r, r + N);
         h_weights[k] = h_responsibilitiesSum[k] / N;
 
         // Weight the data by responsibilities
@@ -113,8 +117,9 @@ void mStep(cublasHandle_t cublasHandle, int D, int N, int K, const float *d_data
         thrust::device_vector<float> d_weightedData(D * N);
 
         int threadsPerBlock = 256;
-        int blocks = std::ceil(N / threadsPerBlock);
-        calculateWeightedData<<<blocks, threadsPerBlock>>>(D, N, d_data, &d_responsibilities[k * N],
+        int blocks = std::ceil((float)N / threadsPerBlock);
+
+        mstep_calculateWeightedData<<<blocks, threadsPerBlock>>>(D, N, d_data, &d_responsibilities[k * N],
                                                            thrust::raw_pointer_cast(d_weightedData.data()));
 
         // Recalculate means
@@ -133,8 +138,8 @@ void mStep(cublasHandle_t cublasHandle, int D, int N, int K, const float *d_data
 
         alpha = 1.0f;
         beta = 0.0f;
-        CUBLAS_CHECK(cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, D, D, 1,
-                                 &alpha, &d_means[k * D], 1, &d_means[k * D], 1,
+        CUBLAS_CHECK(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T, D, D, 1,
+                                 &alpha, &d_means[k * D], D, &d_means[k * D], D,
                                  &beta, &d_covariances[k * D * D], D));
 
         // covariance(DxD) = 1.0/responsibilitesSum * (weighted_data(DxN) * transpose(data)(NxD)) - C(DxD) 
@@ -149,84 +154,10 @@ void mStep(cublasHandle_t cublasHandle, int D, int N, int K, const float *d_data
     free(h_responsibilitiesSum);
 }
 
-void rmvnorm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
-             int N, int D, const float *d_mean, const float *d_covariance, float *d_randomMvNorm) {
 
-    curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-
-    // Do cholesky decomposition on covariance matrices L*transpose(L)
-
-    int Lwork;
- 
-    thrust::device_vector<float> d_covarianceLower(D * D);
-    cudaMemcpy(thrust::raw_pointer_cast(d_covarianceLower.data()),
-               d_covariance, D * D * sizeof(float), cudaMemcpyDeviceToDevice);
- 
-    cusolverDnSpotrf_bufferSize(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D,
-                                thrust::raw_pointer_cast(d_covarianceLower.data()), D, &Lwork);
-
-    thrust::device_vector<int> d_devInfo(1);
-    thrust::device_vector<float> d_workspace(Lwork);
-    cusolverDnSpotrf(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D,
-                     thrust::raw_pointer_cast(d_covarianceLower.data()), D,
-                     thrust::raw_pointer_cast(d_workspace.data()), Lwork,
-                     thrust::raw_pointer_cast(d_devInfo.data()));
-
-    // Generate standard normal variables, (D * N) samples
-
-    thrust::device_vector<float> d_randomNorm(D * N);
-    curandGenerateNormal(gen, thrust::raw_pointer_cast(d_randomNorm.data()), D * N, 0.0, 1.0);
-
-    // Generate multivariate normal from standard normal with mean and covariance lower
-
-    float alpha = 1.0;
-    float beta = 0.0;
-    cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, N, D, &alpha,
-                thrust::raw_pointer_cast(d_covarianceLower.data()), D,
-                thrust::raw_pointer_cast(d_randomNorm.data()), D,
-                &beta, d_randomMvNorm, D);
-
-    curandDestroyGenerator(gen);
-}
-
-void meanAndCovariance(cublasHandle_t cublasHandle, int D, int N, const float *d_data,
-                       float *d_mean, float *d_covariance)
-{
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    thrust::device_vector<float> d_cov1(D * D);
-    thrust::device_vector<float> d_cov2(D * D);
-    thrust::device_vector<float> d_ones(N, 1.0);
-
-    // X*transpose(X) / N
-    alpha = 1.0f / N;
-    CUBLAS_CHECK(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T, D, D, N,
-                             &alpha, d_data, D, d_data, D,
-                             &beta, thrust::raw_pointer_cast(d_cov1.data()), D));
-
-    // Mean vector of each row 
-    alpha = 1.0f / N;
-    CUBLAS_CHECK(cublasSgemv(cublasHandle, CUBLAS_OP_N, D, N,
-                             &alpha, d_data, D, thrust::raw_pointer_cast(d_ones.data()), 1,
-                             &beta, d_mean, 1));
-
-    // means * transpose(means)
-    alpha = 1.0f;
-    CUBLAS_CHECK(cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, D, D, 1,
-                             &alpha, d_mean, 1, d_mean, 1,
-                             &beta, thrust::raw_pointer_cast(d_cov2.data()), D));
-
-    //  (X*transpose(X) / N) -  means * transpose(means)
-    alpha = 1.0f;
-    beta = -1.0f;
-    CUBLAS_CHECK(cublasSgeam(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, D,
-                             &alpha, thrust::raw_pointer_cast(d_cov1.data()), D,
-                             &beta, thrust::raw_pointer_cast(d_cov2.data()), D, d_covariance, D));
-}
 
 // Both d_weights and d_logPdf are NxK matrices column-major
-__global__ void calculateWeightedLogPdf(int N, int K, const float *d_weights, float *d_logPdf)
+__global__ void em_calculateWeightedLogPdf(int N, int K, const float *d_weights, float *d_logPdf)
 {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -238,11 +169,8 @@ __global__ void calculateWeightedLogPdf(int N, int K, const float *d_weights, fl
 }
 
 void expectationMaximizationMVGMM(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
-                                  int D, int N, int K, const float *d_data) {
-
-    thrust::device_vector<float> d_means(K * D);
-    thrust::device_vector<float> d_covariances(K * D * D);
-    thrust::host_vector<float> h_weights(K);
+                                  int D, int N, int K, const float *d_data,
+                                  float *h_weights, float *d_means, float *d_covariances) {
 
     // Initialize weights
 
@@ -253,7 +181,7 @@ void expectationMaximizationMVGMM(cublasHandle_t cublasHandle, cusolverDnHandle_
     // Find mean and covariance of data
 
     thrust::device_vector<float> d_mean(D);
-    thrust::device_vector<float> d_covariance(D*D);
+    thrust::device_vector<float> d_covariance(D * D);
     meanAndCovariance(cublasHandle, D, N, d_data,
                       thrust::raw_pointer_cast(d_mean.data()),
                       thrust::raw_pointer_cast(d_covariance.data()));
@@ -261,7 +189,7 @@ void expectationMaximizationMVGMM(cublasHandle_t cublasHandle, cusolverDnHandle_
     // Generate random cluster means
 
     rmvnorm(cublasHandle, cusolverHandle, K, D, thrust::raw_pointer_cast(d_mean.data()),
-            thrust::raw_pointer_cast(d_covariance.data()), thrust::raw_pointer_cast(d_means.data()));
+            thrust::raw_pointer_cast(d_covariance.data()), d_means);
 
     // Initialize all covariances to be the same. covariance of the data divided by number of clusters
 
@@ -271,35 +199,32 @@ void expectationMaximizationMVGMM(cublasHandle_t cublasHandle, cusolverDnHandle_
                       d_covariance.begin(), thrust::divides<float>());
 
     for (int k = 0; k < K; k++) {
-        cudaMemcpy(thrust::raw_pointer_cast(&d_covariances[k * D * D]),
-                   thrust::raw_pointer_cast(d_covariance.data()),
+        cudaMemcpy(&d_covariances[k * D * D], thrust::raw_pointer_cast(d_covariance.data()),
                    D * D * sizeof(float), cudaMemcpyDeviceToDevice);
     }
 
-/*
     bool converged = false;
     float epsilon = 1.0e-5;
     float Q = -INFINITY;
     thrust::device_vector<float> d_logPdf(N * K);
     thrust::device_vector<float> d_responsibilities(K * N);
+    int threadsPerBlock = 256;
+    int blocks = std::ceil((float)N / threadsPerBlock);
 
     while (!converged) {
-*/
-        eStep(cublasHandle, D, N, K, d_data, thrust::raw_pointer_cast(h_weights.data()),
-              thrust::raw_pointer_cast(d_means.data()), thrust::raw_pointer_cast(d_covariance.data()),
-              thrust::raw_pointer_cast(d_responsibilities.data()));
-/*
-        mStep(cublasHandle, D, N, K, d_data, thrust::raw_pointer_cast(d_responsibilities.data()),
-              thrust::raw_pointer_cast(h_weights.data()), thrust::raw_pointer_cast(d_means.data()),
-              thrust::raw_pointer_cast(d_covariance.data()));
 
-        dmvgmm(cublasHandle, N, D, K, d_data, thrust::raw_pointer_cast(h_weights.data()),
-               thrust::raw_pointer_cast(d_means.data()), thrust::raw_pointer_cast(d_covariances.data()),
+        eStep(cublasHandle, cusolverHandle, D, N, K, d_data, h_weights, d_means,
+              d_covariances, thrust::raw_pointer_cast(d_responsibilities.data()));
+
+        mStep(cublasHandle, D, N, K, d_data,
+              thrust::raw_pointer_cast(d_responsibilities.data()),
+              h_weights, d_means, d_covariances);
+
+        dmvgmm(cublasHandle, cusolverHandle, N, D, K, d_data,
+               h_weights, d_means, d_covariances,
                thrust::raw_pointer_cast(d_logPdf.data()), true);
 
-        int threadsPerBlock = 256;
-        int blocks = std::ceil(N / 256);
-        calculateWeightedLogPdf<<<blocks, threadsPerBlock>>>(N, K,
+        em_calculateWeightedLogPdf<<<blocks, threadsPerBlock>>>(N, K,
                     thrust::raw_pointer_cast(d_responsibilities.data()),
                     thrust::raw_pointer_cast(d_logPdf.data()));
 
@@ -311,5 +236,4 @@ void expectationMaximizationMVGMM(cublasHandle_t cublasHandle, cusolverDnHandle_
 
         Q = Qn;
     }
-*/
 }

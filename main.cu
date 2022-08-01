@@ -45,10 +45,31 @@ int main(int argc, char *argv[]) {
            thrust::raw_pointer_cast(d_means.data()), thrust::raw_pointer_cast(d_covariances.data()),
            thrust::raw_pointer_cast(d_data.data()));
 
-    std::cout << "Generate random values" << std::endl;
-
     expectationMaximizationMVGMM(cublasHandle, cusolverHandle,
-                                 D, N, K, thrust::raw_pointer_cast(d_data.data()));
+                                 D, N, K, thrust::raw_pointer_cast(d_data.data()), h_weights,
+                                 thrust::raw_pointer_cast(d_means.data()),
+                                 thrust::raw_pointer_cast(d_covariances.data()));
+
+    thrust::host_vector<float> h_meansResult = d_means;
+    thrust::host_vector<float> h_covariancesResult = d_covariances;
+    for (int k = 0; k < K; k++) {
+
+        std::cout << "Cluster " << k << std::endl;
+
+        std::cout << "\tWeight = " << h_weights[k] << std::endl;
+
+        std::cout << "\tMean = ";
+        for (int d = 0; d < D; d++) {
+            std::cout << h_meansResult[k * D + d] << " ";
+        }
+        std::cout << std::endl;
+        
+        std::cout << "\tCovariance = ";
+        for (int d = 0; d < D * D; d++) {
+            std::cout << h_covariancesResult[k * D * D + d] << " ";
+        }
+        std::cout << std::endl << std::endl;
+    }
 
     // Cleanup
 

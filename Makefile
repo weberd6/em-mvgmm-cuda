@@ -7,7 +7,7 @@ OBJ_DIR = src
 INC_DIR = include
 
 EXE = em_mvgmm_cuda
-OBJS = $(OBJ_DIR)/main.o $(OBJ_DIR)/em-mvgmm.o $(OBJ_DIR)/mvgmm.o
+OBJS = $(OBJ_DIR)/main.o $(OBJ_DIR)/em-mvgmm.o $(OBJ_DIR)/mvgmm.o $(OBJ_DIR)/mvnorm.o $(OBJ_DIR)/stats.o
 
 LINK_FLAGS = -L$(CUDA_LIB_DIR)
 LINK_LIBS = -lcudart -lcublas -lcurand -lcusolver
