@@ -1,4 +1,5 @@
 #include <mvgmm.h>
+#include <mvnorm.h>
 #include <math_constants.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -96,72 +97,15 @@ void rmvgmm(cublasHandle_t cublasHandle, cusolverDnHandle_t cusolverHandle,
                                                thrust::raw_pointer_cast(d_uniformRand.data()),
                                                thrust::raw_pointer_cast(d_clusters.data()));
 
-    // Copy means and covariances to arrays of pointers
-
-    std::vector<float*> meansArray(K);
-    std::vector<float*> covariancesArray(K);
+    int n = 0;
     for (int k = 0; k < K; k++) {
 
-        CUDA_CHECK(cudaMalloc(&meansArray[k], D * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(meansArray[k], &d_means[k * D], D * sizeof(float), cudaMemcpyDeviceToDevice));
+        int cluster_count = thrust::count(d_clusters.begin(), d_clusters.end(), k);
 
-        CUDA_CHECK(cudaMalloc(&covariancesArray[k], D * D * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(covariancesArray[k], &d_covariances[k * D * D],
-                              D * D * sizeof(float), cudaMemcpyDeviceToDevice));
-    }
-    thrust::device_vector<float*> d_meansArray = meansArray;
-    thrust::device_vector<float*> d_covariancesArray = covariancesArray;
+        rmvnorm(cublasHandle, cusolverHandle, cluster_count, D,
+                &d_means[k * D], &d_covariances[k * D * D], &d_randomValues[n * D]);
 
-    // Do cholesky decomposition on covariance matrices L*transpose(L)
-
-    thrust::device_vector<int> d_infoArray(K);
-    CUSOLVER_CHECK(cusolverDnSpotrfBatched(cusolverHandle, CUBLAS_FILL_MODE_LOWER, D,
-                                           thrust::raw_pointer_cast(d_covariancesArray.data()), D,
-                                           thrust::raw_pointer_cast(d_infoArray.data()), K));
-
-    float *h_covarianceLower = (float *)malloc(D * D * sizeof(float));
-    for (int k = 0; k < K; k++) {
-        cudaMemcpy(h_covarianceLower, covariancesArray[k], D * D * sizeof(float), cudaMemcpyDeviceToHost);
-        h_covarianceLower[3] = 0.0f;
-        h_covarianceLower[6] = 0.0f;
-        h_covarianceLower[7] = 0.0f;
-        cudaMemcpy(covariancesArray[k], h_covarianceLower, D * D * sizeof(float), cudaMemcpyHostToDevice);
-    }
-    free(h_covarianceLower);
-
-    // Generate standard normal variables, (D * N) samples
-
-    thrust::device_vector<float> d_normalRand(D * N);
-    curandGenerateNormal(gen, thrust::raw_pointer_cast(d_normalRand.data()), D * N, 0.0, 1.0);
-
-    // For each sample, create pointer to assigned cluster mean and covariance lower
-
-    thrust::device_vector<float*> d_ptrSamples(N);
-    thrust::device_vector<float*> d_ptrCovariances(N);
-    thrust::device_vector<float*> d_ptrMeans(N);
-
-    rmvgmm_setupBatchMultiply<<<blocks, threadsPerBlock>>>(N, D,
-                                            thrust::raw_pointer_cast(d_clusters.data()),
-                                            thrust::raw_pointer_cast(d_normalRand.data()),
-                                            thrust::raw_pointer_cast(d_meansArray.data()),
-                                            thrust::raw_pointer_cast(d_covariancesArray.data()),
-                                            thrust::raw_pointer_cast(d_ptrSamples.data()),
-                                            thrust::raw_pointer_cast(d_ptrMeans.data()),
-                                            thrust::raw_pointer_cast(d_ptrCovariances.data()),
-                                            d_randomValues);
-
-    // Generate random multivarate normal by multiplying each data sample by covariance lower and adding mean
-
-    float alpha = 1.0;
-    float beta = 1.0;
-    CUBLAS_CHECK(cublasSgemmBatched(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, D, 1, D, &alpha,
-                                    thrust::raw_pointer_cast(d_ptrCovariances.data()), D,
-                                    thrust::raw_pointer_cast(d_ptrSamples.data()), D,
-                                    &beta, thrust::raw_pointer_cast(d_ptrMeans.data()), D, N));
-
-    for (int k = 0; k < K; k++) {
-        CUDA_CHECK(cudaFree(d_meansArray[k]));
-        CUDA_CHECK(cudaFree(d_covariancesArray[k]));
+        n += cluster_count;
     }
 
     curandDestroyGenerator(gen);
